@@ -65,15 +65,43 @@ See the `examples/` directory for complete working examples:
 - **[basic](examples/basic/)** - Simple shell commands to get started
 - **[nginx-webapp](examples/nginx-webapp/)** - Multi-process setup with Nginx and Python web application
 
+## Process logs
+
+By default, a managed process' stdout/stderr are drained (so the process never blocks
+on a full pipe buffer) but otherwise discarded. Set `log_forward = true` on a program
+to:
+
+- forward each line to cirond's own log output, tagged with the process name and
+  stream (`stdout`/`stderr`) — this is what shows up alongside cirond's own logs in
+  `kubectl logs` or `docker logs`;
+- keep the last 1000 lines per process in memory, queryable through the `GetLogs` gRPC
+  method and the `cironctl logs` command (including `--follow` for live tailing).
+
+```toml
+[program.cloudflared]
+command = "/usr/local/bin/cloudflared tunnel run"
+autostart = true
+restart = "always"
+log_forward = true
+```
+
+```bash
+./target/release/cironctl -t unix:///tmp/cirond.sock logs cloudflared --lines 100
+./target/release/cironctl -t unix:///tmp/cirond.sock logs cloudflared --follow
+```
+
+Querying logs for a process that doesn't have `log_forward` enabled returns an error
+explaining how to enable it. This is opt-in per process so noisy or high-throughput
+processes don't pay the cost of buffering/broadcasting their output unless you need it.
+
 ## TODO
 
-- [ ] Add comprehensive logging with log rotation
+- [ ] Add log rotation / configurable buffer size for `log_forward`
 - [ ] Implement process resource limits (CPU, memory)
 - [ ] Add process dependency management
 - [ ] Implement health checks for monitored processes
 - [ ] Support for process groups
 - [ ] Signal handling for graceful shutdown
-- [ ] Process output capture and log management
 - [ ] Web UI for process monitoring
 - [ ] `systemd` integration
 - [ ] Configuration hot-reload
@@ -105,6 +133,9 @@ vsock_port = 50051
 command = "./webapp"
 autostart = true
 restart = "always"
+# Forward stdout/stderr into cirond's logs and make them queryable via
+# `cironctl logs web` (default: false). See "Process logs" above.
+log_forward = true
 
 [program.web.env]
 PORT = "8080"

@@ -1,11 +1,17 @@
 use anyhow::{Context, Result};
 use ciron_common::{GlobalConfig, ProgramConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+/// Number of log lines kept in memory per process for `GetLogs` requests.
+const LOG_BUFFER_CAPACITY: usize = 1000;
 
 #[derive(Debug, Clone)]
 pub enum ProcessEvent {
@@ -13,6 +19,28 @@ pub enum ProcessEvent {
     Exited(String, i32),
     Failed(String, String),
     RestartRequested(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSource {
+    Stdout,
+    Stderr,
+}
+
+impl LogSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogSource::Stdout => "stdout",
+            LogSource::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub timestamp_ms: u128,
+    pub source: LogSource,
+    pub message: String,
 }
 
 pub struct ProcessManager {
@@ -27,6 +55,77 @@ struct ManagedProcess {
     monitor_handle: Option<JoinHandle<()>>,
     pid: Option<u32>,
     running: bool,
+    log_buffer: Arc<Mutex<VecDeque<LogLine>>>,
+    log_tx: broadcast::Sender<LogLine>,
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// Reads a child process' stdout/stderr line by line, forwards each line to the
+/// daemon's own tracing output (so it shows up alongside cirond's logs, e.g. in
+/// `kubectl logs`), and records it in the in-memory ring buffer / broadcast
+/// channel used to serve `GetLogs` requests.
+///
+/// When `forward` is false (the default, `log_forward = false`), the pipe is
+/// still drained so the child never blocks on a full stdout/stderr buffer, but
+/// nothing is logged or recorded.
+fn spawn_log_reader<R>(
+    name: String,
+    source: LogSource,
+    reader: R,
+    log_buffer: Arc<Mutex<VecDeque<LogLine>>>,
+    log_tx: broadcast::Sender<LogLine>,
+    forward: bool,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if !forward {
+            let mut reader = reader;
+            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            return;
+        }
+
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(message)) => {
+                    info!(target: "cirond::child", process = %name, stream = source.as_str(), "{}", message);
+
+                    let entry = LogLine {
+                        timestamp_ms: now_millis(),
+                        source,
+                        message,
+                    };
+
+                    {
+                        let mut buf = log_buffer.lock().await;
+                        if buf.len() >= LOG_BUFFER_CAPACITY {
+                            buf.pop_front();
+                        }
+                        buf.push_back(entry.clone());
+                    }
+
+                    let _ = log_tx.send(entry);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(
+                        "Error reading {} log stream for {}: {}",
+                        source.as_str(),
+                        name,
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+    });
 }
 
 impl ProcessManager {
@@ -42,6 +141,7 @@ impl ProcessManager {
     pub fn load_from_config(&mut self, config: GlobalConfig) {
         for (name, program_config) in config.program {
             info!("Loaded program configuration: {}", name);
+            let (log_tx, _) = broadcast::channel(LOG_BUFFER_CAPACITY);
             self.processes.insert(
                 name.clone(),
                 ManagedProcess {
@@ -50,6 +150,8 @@ impl ProcessManager {
                     monitor_handle: None,
                     pid: None,
                     running: false,
+                    log_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_CAPACITY))),
+                    log_tx,
                 },
             );
         }
@@ -118,6 +220,30 @@ impl ProcessManager {
 
         // Store the PID
         process.pid = pid;
+
+        // Always drain stdout/stderr so the child never blocks on a full pipe
+        // buffer; only forward/record the output when log_forward is enabled.
+        let log_forward = process.config.log_forward;
+        if let Some(stdout) = child.stdout.take() {
+            spawn_log_reader(
+                name.to_string(),
+                LogSource::Stdout,
+                stdout,
+                process.log_buffer.clone(),
+                process.log_tx.clone(),
+                log_forward,
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_log_reader(
+                name.to_string(),
+                LogSource::Stderr,
+                stderr,
+                process.log_buffer.clone(),
+                process.log_tx.clone(),
+                log_forward,
+            );
+        }
 
         let _ = self.event_tx.send(ProcessEvent::Started(name.to_string()));
 
@@ -263,6 +389,48 @@ impl ProcessManager {
             .iter()
             .map(|(name, process)| (name.clone(), process.running))
             .collect()
+    }
+
+    /// Returns up to `lines` most recent buffered log lines for a process
+    /// (all buffered lines if `lines` is 0).
+    pub async fn get_recent_logs(&self, name: &str, lines: usize) -> Result<Vec<LogLine>> {
+        let process = self
+            .processes
+            .get(name)
+            .context(format!("Program {} not found", name))?;
+
+        if !process.config.log_forward {
+            anyhow::bail!(
+                "Log forwarding is disabled for process '{}': set log_forward = true in its configuration to enable GetLogs/cironctl logs",
+                name
+            );
+        }
+
+        let buf = process.log_buffer.lock().await;
+        let start = if lines == 0 || lines >= buf.len() {
+            0
+        } else {
+            buf.len() - lines
+        };
+
+        Ok(buf.iter().skip(start).cloned().collect())
+    }
+
+    /// Subscribes to new log lines produced by a process as they are emitted.
+    pub fn subscribe_logs(&self, name: &str) -> Result<broadcast::Receiver<LogLine>> {
+        let process = self
+            .processes
+            .get(name)
+            .context(format!("Program {} not found", name))?;
+
+        if !process.config.log_forward {
+            anyhow::bail!(
+                "Log forwarding is disabled for process '{}': set log_forward = true in its configuration to enable GetLogs/cironctl logs",
+                name
+            );
+        }
+
+        Ok(process.log_tx.subscribe())
     }
 
     pub async fn stop_all(&mut self) {

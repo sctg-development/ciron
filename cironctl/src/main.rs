@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ciron_common::{
-    CironDaemonClient, GetStatusRequest, RestartProcessRequest, StartProcessRequest,
-    StopProcessRequest, Transport,
+    CironDaemonClient, GetLogsRequest, GetStatusRequest, RestartProcessRequest,
+    StartProcessRequest, StopProcessRequest, Transport,
 };
 use clap::{Parser, Subcommand};
 
@@ -226,6 +226,36 @@ async fn main() -> Result<()> {
                 println!("Success: {}", resp.message);
             } else {
                 println!("Failed: {}", resp.message);
+            }
+
+            Ok(())
+        }
+        Commands::Logs {
+            name,
+            follow,
+            lines,
+        } => {
+            let mut stream = client
+                .get_logs(GetLogsRequest {
+                    name: name.clone(),
+                    follow,
+                    lines,
+                    since: None,
+                })
+                .await
+                .context("Failed to get logs")?
+                .into_inner();
+
+            loop {
+                match stream.message().await {
+                    Ok(Some(entry)) => {
+                        println!("[{}] {}", entry.source, entry.message);
+                    }
+                    Ok(None) => break,
+                    Err(status) => {
+                        return Err(anyhow::anyhow!("Log stream error: {}", status));
+                    }
+                }
             }
 
             Ok(())

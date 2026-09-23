@@ -1,7 +1,7 @@
 use ciron_common::{
     CironDaemon, DaemonInfo, GetLogsRequest, GetProcessStatusRequest, GetStatusRequest,
-    GetStatusResponse, LogEntry, ProcessConfig, ProcessEvent as ProtoProcessEvent, ProcessState,
-    ProcessStatus as ProtoProcessStatus, ReloadConfigRequest, ReloadConfigResponse,
+    GetStatusResponse, LogEntry, LogLevel, ProcessConfig, ProcessEvent as ProtoProcessEvent,
+    ProcessState, ProcessStatus as ProtoProcessStatus, ReloadConfigRequest, ReloadConfigResponse,
     RestartProcessRequest, RestartProcessResponse, ShutdownRequest, ShutdownResponse,
     StartProcessRequest, StartProcessResponse, StopProcessRequest, StopProcessResponse,
     StreamEventsRequest, TransportInfo, TransportType,
@@ -12,7 +12,19 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
 
-use crate::process::ProcessManager;
+use crate::process::{LogLine, LogSource, ProcessManager};
+
+fn to_log_entry(line: &LogLine) -> LogEntry {
+    LogEntry {
+        timestamp: line.timestamp_ms.to_string(),
+        level: match line.source {
+            LogSource::Stdout => LogLevel::Info as i32,
+            LogSource::Stderr => LogLevel::Warn as i32,
+        },
+        source: line.source.as_str().to_string(),
+        message: line.message.clone(),
+    }
+}
 
 pub struct CironDaemonService {
     manager: Arc<RwLock<ProcessManager>>,
@@ -274,9 +286,64 @@ impl CironDaemon for CironDaemonService {
 
     async fn get_logs(
         &self,
-        _request: Request<GetLogsRequest>,
+        request: Request<GetLogsRequest>,
     ) -> Result<Response<Self::GetLogsStream>, Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        let name = req.name;
+        info!(
+            "Received GetLogs request for: {} (follow: {}, lines: {})",
+            name, req.follow, req.lines
+        );
+
+        let manager = self.manager.read().await;
+
+        let lines = if req.lines <= 0 { 0 } else { req.lines as usize };
+        let recent = manager
+            .get_recent_logs(&name, lines)
+            .await
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        let follow_rx = if req.follow {
+            Some(
+                manager
+                    .subscribe_logs(&name)
+                    .map_err(|e| Status::not_found(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        drop(manager);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+
+        tokio::spawn(async move {
+            for line in &recent {
+                if tx.send(Ok(to_log_entry(line))).await.is_err() {
+                    return;
+                }
+            }
+
+            let Some(mut follow_rx) = follow_rx else {
+                return;
+            };
+
+            loop {
+                match follow_rx.recv().await {
+                    Ok(line) => {
+                        if tx.send(Ok(to_log_entry(&line))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn reload_config(

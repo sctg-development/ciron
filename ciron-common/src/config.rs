@@ -73,6 +73,13 @@ pub struct ProgramConfig {
     pub restart: Option<String>,
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+    /// When true, this process' stdout/stderr are forwarded into cirond's own
+    /// log output (visible e.g. via `kubectl logs`) and kept in a buffer so
+    /// they can be queried through `GetLogs` / `cironctl logs`. Disabled by
+    /// default: the pipes are still drained so the child never blocks, but
+    /// nothing is recorded or logged.
+    #[serde(default)]
+    pub log_forward: bool,
 }
 
 pub fn load_config(path: &str) -> Result<GlobalConfig> {
