@@ -14,11 +14,11 @@ ciron-common = { path = "../ciron-common" }
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-tonic = "0.12"
-prost = "0.13"
+tonic = "0.14.6"
+prost = "0.14.4"
 tokio-stream = "0.1"
-tower = "0.4"
+tower = "0.5.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-vsock = "0.5"
+tokio-vsock = "0.7.2"
