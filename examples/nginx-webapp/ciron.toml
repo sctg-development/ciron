@@ -25,3 +25,7 @@ PYTHONUNBUFFERED = "1"
 command = "nginx -c /etc/nginx/nginx.conf -g 'daemon off;'"
 autostart = true
 restart = "always"
+# Make sure the backend is (attempted to be) started before nginx, since it
+# proxies to it.
+after = ["webapp"]
+wants = ["webapp"]

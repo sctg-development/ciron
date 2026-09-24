@@ -1,4 +1,5 @@
 mod grpc_server;
+mod log_format;
 mod process;
 
 use ciron_common::{CironDaemonServer, Transport, load_config};
@@ -91,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
+        .event_format(log_format::CironFormatter)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 

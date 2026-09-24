@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use ciron_common::{GlobalConfig, ProgramConfig};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -166,6 +166,11 @@ impl ProcessManager {
             .collect();
 
         for name in programs_to_start {
+            // May already be running: starting an earlier autostart program
+            // can pull this one in first via its `after`/`wants` list.
+            if self.processes.get(&name).is_some_and(|p| p.running) {
+                continue;
+            }
             if let Err(e) = self.start_process(&name).await {
                 error!("Failed to start autostart program {}: {}", name, e);
             }
@@ -174,7 +179,130 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// Resolves which processes must be started for `name` to come up, in the
+    /// order they must be started in.
+    ///
+    /// Mirrors a (deliberately simplified) systemd transaction: starting from
+    /// `name`, it follows `after` and `wants` edges to find every program
+    /// that should come up alongside it, then topologically sorts that set so
+    /// that each program's `after` list is started before it. Unknown
+    /// program names and dependency cycles are logged and skipped rather
+    /// than treated as errors, since (like systemd's `After=`/`Wants=`)
+    /// neither option is a hard requirement.
+    fn resolve_start_order(&self, name: &str) -> Result<Vec<String>> {
+        if !self.processes.contains_key(name) {
+            return Err(anyhow::anyhow!("Program {} not found", name));
+        }
+
+        // Breadth-first discovery of every program that should be started
+        // alongside `name`, in discovery order (kept for deterministic,
+        // stable output).
+        let mut discovered = vec![name.to_string()];
+        let mut seen: HashSet<String> = discovered.iter().cloned().collect();
+        let mut queue: VecDeque<String> = discovered.iter().cloned().collect();
+
+        while let Some(current) = queue.pop_front() {
+            let config = &self.processes[&current].config;
+            let deps = config
+                .after
+                .iter()
+                .flatten()
+                .chain(config.wants.iter().flatten());
+
+            for dep in deps {
+                if !self.processes.contains_key(dep) {
+                    warn!(
+                        "Process '{}' references unknown program '{}' in after/wants",
+                        current, dep
+                    );
+                    continue;
+                }
+                if seen.insert(dep.clone()) {
+                    discovered.push(dep.clone());
+                    queue.push_back(dep.clone());
+                }
+            }
+        }
+
+        // Topologically sort by `after`: an edge dep -> unit means dep must
+        // be started before unit.
+        let mut in_degree: HashMap<&str, usize> =
+            discovered.iter().map(|n| (n.as_str(), 0)).collect();
+        let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+        for unit in &discovered {
+            for dep in self.processes[unit].config.after.iter().flatten() {
+                if seen.contains(dep) {
+                    dependents.entry(dep.as_str()).or_default().push(unit);
+                    *in_degree.get_mut(unit.as_str()).unwrap() += 1;
+                }
+            }
+        }
+
+        let mut ready: VecDeque<&str> = discovered
+            .iter()
+            .map(String::as_str)
+            .filter(|n| in_degree[n] == 0)
+            .collect();
+        let mut sorted: Vec<String> = Vec::with_capacity(discovered.len());
+
+        while let Some(unit) = ready.pop_front() {
+            sorted.push(unit.to_string());
+            for dependent in dependents.get(unit).into_iter().flatten() {
+                let degree = in_degree.get_mut(dependent).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push_back(dependent);
+                }
+            }
+        }
+
+        if sorted.len() != discovered.len() {
+            warn!(
+                "Dependency cycle detected in 'after' configuration while starting '{}'; \
+                 starting remaining processes in their original order",
+                name
+            );
+            for unit in &discovered {
+                if !sorted.contains(unit) {
+                    sorted.push(unit.clone());
+                }
+            }
+        }
+
+        Ok(sorted)
+    }
+
+    /// Starts `name`, first starting (best effort) every program it `wants`
+    /// or is configured to come `after`. See [`resolve_start_order`].
+    ///
+    /// [`resolve_start_order`]: Self::resolve_start_order
     pub async fn start_process(&mut self, name: &str) -> Result<()> {
+        let order = self.resolve_start_order(name)?;
+
+        let mut root_result = None;
+        for unit in order {
+            if unit == name {
+                root_result = Some(self.start_process_single(&unit).await);
+                continue;
+            }
+
+            if self.processes.get(&unit).is_some_and(|p| p.running) {
+                continue;
+            }
+
+            if let Err(e) = self.start_process_single(&unit).await {
+                warn!(
+                    "Failed to start '{}' (pulled in via after/wants of '{}'): {}",
+                    unit, name, e
+                );
+            }
+        }
+
+        root_result.expect("resolve_start_order always includes its own root")
+    }
+
+    async fn start_process_single(&mut self, name: &str) -> Result<()> {
         let process = self
             .processes
             .get_mut(name)
@@ -446,5 +574,131 @@ impl ProcessManager {
     pub fn shutdown(&mut self) {
         info!("Shutting down process manager");
         self.event_rx.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ciron_common::TransportConfig;
+
+    fn program(command: &str) -> ProgramConfig {
+        ProgramConfig {
+            command: command.to_string(),
+            autostart: false,
+            restart: None,
+            env: None,
+            log_forward: false,
+            after: None,
+            wants: None,
+        }
+    }
+
+    fn manager_with(programs: Vec<(&str, ProgramConfig)>) -> ProcessManager {
+        let mut manager = ProcessManager::new();
+        let program = programs
+            .into_iter()
+            .map(|(name, config)| (name.to_string(), config))
+            .collect();
+        manager.load_from_config(GlobalConfig {
+            log_level: None,
+            transport: TransportConfig::default(),
+            program,
+        });
+        manager
+    }
+
+    #[test]
+    fn after_dependency_is_started_first() {
+        let mut b = program("b");
+        b.after = Some(vec!["a".to_string()]);
+        let manager = manager_with(vec![("a", program("a")), ("b", b)]);
+
+        let order = manager.resolve_start_order("b").unwrap();
+        assert_eq!(order, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn after_chains_transitively() {
+        // c after b after a: must start in the order a, b, c.
+        let mut b = program("b");
+        b.after = Some(vec!["a".to_string()]);
+        let mut c = program("c");
+        c.after = Some(vec!["b".to_string()]);
+        let manager = manager_with(vec![("a", program("a")), ("b", b), ("c", c)]);
+
+        let order = manager.resolve_start_order("c").unwrap();
+        assert_eq!(
+            order,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn wants_pulls_in_the_wanted_program() {
+        let mut a = program("a");
+        a.wants = Some(vec!["b".to_string()]);
+        let manager = manager_with(vec![("a", a), ("b", program("b"))]);
+
+        let order = manager.resolve_start_order("a").unwrap();
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&"a".to_string()));
+        assert!(order.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn wants_alone_does_not_impose_ordering() {
+        // With no `after`, `a` is free to start before or after the program
+        // it wants; only its own presence in the closure is guaranteed.
+        let mut a = program("a");
+        a.wants = Some(vec!["b".to_string()]);
+        let manager = manager_with(vec![("a", a), ("b", program("b"))]);
+
+        let order = manager.resolve_start_order("a").unwrap();
+        assert_eq!(order[0], "a");
+    }
+
+    #[test]
+    fn unknown_dependencies_are_ignored() {
+        let mut a = program("a");
+        a.after = Some(vec!["missing".to_string()]);
+        a.wants = Some(vec!["also-missing".to_string()]);
+        let manager = manager_with(vec![("a", a)]);
+
+        let order = manager.resolve_start_order("a").unwrap();
+        assert_eq!(order, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn unknown_root_is_an_error() {
+        let manager = manager_with(vec![]);
+        assert!(manager.resolve_start_order("missing").is_err());
+    }
+
+    #[test]
+    fn after_cycle_is_broken_without_losing_any_process() {
+        let mut a = program("a");
+        a.after = Some(vec!["b".to_string()]);
+        let mut b = program("b");
+        b.after = Some(vec!["a".to_string()]);
+        let manager = manager_with(vec![("a", a), ("b", b)]);
+
+        let mut order = manager.resolve_start_order("a").unwrap();
+        order.sort();
+        assert_eq!(order, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn root_appears_only_once_when_it_is_also_wanted() {
+        // `a` wants `b`, and `b` happens to list `a` back via `after`. `a` is
+        // both the root and a dependency of `b`, but must only appear once.
+        let mut a = program("a");
+        a.wants = Some(vec!["b".to_string()]);
+        let mut b = program("b");
+        b.after = Some(vec!["a".to_string()]);
+        let manager = manager_with(vec![("a", a), ("b", b)]);
+
+        let order = manager.resolve_start_order("a").unwrap();
+        assert_eq!(order, vec!["a".to_string(), "b".to_string()]);
     }
 }

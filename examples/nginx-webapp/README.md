@@ -53,5 +53,7 @@ cargo build --release --bin cironctl
 - **cirond**: Runs as PID 1 in the container, managing both processes
 - **webapp**: Python HTTP server on port 8080
 - **nginx**: Nginx reverse proxy on port 80, forwarding to Python app
+- `nginx` declares `after = ["webapp"]` and `wants = ["webapp"]`, so cirond starts
+  webapp first
 - Both processes automatically restart if they crash
 - You can control processes via **cironctl** from outside the container

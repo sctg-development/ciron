@@ -80,6 +80,18 @@ pub struct ProgramConfig {
     /// nothing is recorded or logged.
     #[serde(default)]
     pub log_forward: bool,
+    /// Names of other configured programs that should be started before this
+    /// one, if they are going to be started at all. Mirrors systemd's
+    /// `After=`: it only orders processes relative to one another and never
+    /// starts anything by itself. Combine with `wants` to also pull the
+    /// dependency in.
+    #[serde(default)]
+    pub after: Option<Vec<String>>,
+    /// Names of other configured programs to start alongside this one, best
+    /// effort. Mirrors systemd's `Wants=`: a failure to start (or the
+    /// absence of) a wanted program never prevents this one from starting.
+    #[serde(default)]
+    pub wants: Option<Vec<String>>,
 }
 
 pub fn load_config(path: &str) -> Result<GlobalConfig> {

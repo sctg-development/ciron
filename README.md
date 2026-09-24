@@ -94,11 +94,39 @@ Querying logs for a process that doesn't have `log_forward` enabled returns an e
 explaining how to enable it. This is opt-in per process so noisy or high-throughput
 processes don't pay the cost of buffering/broadcasting their output unless you need it.
 
+## Process dependencies
+
+Programs can declare dependencies on other programs, inspired by systemd's `After=`
+and `Wants=`:
+
+- `after`: a list of program names that must be started before this one, if they are
+  going to be started at all. It only orders processes relative to each other; on its
+  own it never causes anything to start.
+- `wants`: a list of program names to start alongside this one, best effort. A missing
+  program, or one that fails to start, does not prevent this program from starting.
+
+```toml
+[program.db]
+command = "postgres -D /var/lib/postgresql/data"
+autostart = true
+
+[program.web]
+command = "./webapp"
+autostart = true
+# Start db first, and bring it up alongside web even if web is started manually.
+after = ["db"]
+wants = ["db"]
+```
+
+Starting a program (via `autostart` or `cironctl start`) resolves its `after`/`wants`
+into a start order and brings up the whole set; already-running dependencies are left
+alone. Unknown program names and dependency cycles are logged and skipped rather than
+treated as errors, matching systemd's `After=`/`Wants=` semantics.
+
 ## TODO
 
 - [ ] Add log rotation / configurable buffer size for `log_forward`
 - [ ] Implement process resource limits (CPU, memory)
-- [ ] Add process dependency management
 - [ ] Implement health checks for monitored processes
 - [ ] Support for process groups
 - [ ] Signal handling for graceful shutdown
